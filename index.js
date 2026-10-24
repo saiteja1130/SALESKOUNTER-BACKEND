@@ -17,8 +17,18 @@ import followUpRoutes from "./routes/followUpRoutes.js";
 import organizationRoutes from "./routes/organizationRoutes.js";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
 import { startFollowUpSchedulerWorker } from "./helpers/followUpEngine.js";
-import { restoreActiveConnections } from "./helpers/whatsappManager.js";
+import { restoreActiveConnections, startWhatsAppWatchdog } from "./helpers/whatsappManager.js";
 import { attachWhatsAppSocketGateway } from "./helpers/whatsappSocketGateway.js";
+import { startOutboundQueueWorker } from "./helpers/outboundQueue.js";
+
+// Intercept unhandled rejections and exceptions from background workers (e.g. Baileys socket drops, pre-key timeouts)
+process.on("unhandledRejection", (reason) => {
+  console.warn("[Process] Intercepted unhandled rejection:", reason?.message || reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[Process] Intercepted uncaught exception:", err?.message || err);
+});
 
 const app = express();
 
@@ -101,6 +111,8 @@ httpServer.listen(PORT, async () => {
   console.log(`=======================================================`);
   await connectPlatformDB();
   await restoreActiveConnections();
+  startWhatsAppWatchdog();
+  startOutboundQueueWorker();
   startFollowUpSchedulerWorker();
 });
 

@@ -230,6 +230,12 @@ export const whatsAppMessageSchema = new mongoose.Schema(
       default: "queued",
       index: true,
     },
+    deliveryStatus: {
+      type: String,
+      enum: ["queued", "sending", "sent", "delivered", "read", "failed", "retryable", "uncertain", "suppressed"],
+      default: undefined,
+      index: true,
+    },
     source: {
       type: String,
       enum: ["ai", "follow_up", "campaign", "manual", "inbound"],
@@ -343,6 +349,7 @@ export const leadSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      unique: true,
       index: true,
     },
     email: {
@@ -417,6 +424,11 @@ export const leadSchema = new mongoose.Schema(
     aiHandled: {
       type: Boolean,
       default: true,
+    },
+    aiPausedUntil: {
+      type: Date,
+      default: null,
+      index: true,
     },
     needsAttention: {
       type: Boolean,

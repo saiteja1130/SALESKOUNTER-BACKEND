@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { env } from "../configs/env.js";
 
 /**
  * Hash a password using scrypt with a unique random salt
@@ -65,13 +66,26 @@ export function slugify(text) {
     .slice(0, 30);
 }
 
+const derivedKeyCache = new Map();
+function getDerivedEncryptionKey(secret) {
+  let key = derivedKeyCache.get(secret);
+  if (!key) {
+    key = crypto.scryptSync(secret, "conversly_secret_salt", 32);
+    derivedKeyCache.set(secret, key);
+  }
+  return key;
+}
+
 /**
  * Encrypt sensitive credentials (e.g. API keys) using AES-256-GCM
  */
-export function encryptSecret(plainText, secret = process.env.SESSION_SECRET || "conversly_super_secure_session_secret_key_2026_dev") {
+export function encryptSecret(plainText, secret = env.SESSION_SECRET) {
   if (!plainText) return "";
+  if (!secret) {
+    throw new Error("Encryption secret is not configured.");
+  }
   const iv = crypto.randomBytes(12);
-  const key = crypto.scryptSync(secret, "conversly_secret_salt", 32);
+  const key = getDerivedEncryptionKey(secret);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const encrypted = Buffer.concat([cipher.update(plainText, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
@@ -81,14 +95,15 @@ export function encryptSecret(plainText, secret = process.env.SESSION_SECRET || 
 /**
  * Decrypt sensitive credentials previously encrypted with encryptSecret
  */
-export function decryptSecret(encryptedPayload, secret = process.env.SESSION_SECRET || "conversly_super_secure_session_secret_key_2026_dev") {
+export function decryptSecret(encryptedPayload, secret = env.SESSION_SECRET) {
   if (!encryptedPayload || !encryptedPayload.includes(":")) return "";
+  if (!secret) return "";
   try {
     const [ivHex, tagHex, dataHex] = encryptedPayload.split(":");
     const iv = Buffer.from(ivHex, "hex");
     const tag = Buffer.from(tagHex, "hex");
     const encrypted = Buffer.from(dataHex, "hex");
-    const key = crypto.scryptSync(secret, "conversly_secret_salt", 32);
+    const key = getDerivedEncryptionKey(secret);
     const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
     decipher.setAuthTag(tag);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
@@ -97,6 +112,11 @@ export function decryptSecret(encryptedPayload, secret = process.env.SESSION_SEC
     return "";
   }
 }
+
 export function getWhatsAppEncryptionSecret() {
-  return process.env.WHATSAPP_ENCRYPTION_SECRET || process.env.SESSION_SECRET || "conversly_wa_auth_encryption_secret_key_2026_dev";
+  const secret = env.WHATSAPP_ENCRYPTION_SECRET || env.SESSION_SECRET;
+  if (!secret) {
+    throw new Error("WhatsApp encryption secret is not configured.");
+  }
+  return secret;
 }

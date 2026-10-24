@@ -2,7 +2,7 @@ import { getTenantModels } from "../models/tenant/schemas.js";
 import { Organization } from "../models/platform/Organization.js";
 import { Subscription } from "../models/platform/Subscription.js";
 import { computeEntitlements } from "./entitlements.js";
-import { getTenantDB } from "../configs/db.js";
+import { getTenantDB, isDbConnected } from "../configs/db.js";
 import { enqueueOutboundMessage } from "./outboundQueue.js";
 
 /**
@@ -263,7 +263,7 @@ export async function executeDueFollowUps({ tenantDb, organization, entitlements
     const claimed = await ScheduledFollowUp.findOneAndUpdate(
       { _id: job._id, status: "pending" },
       { $set: { status: "processing" } },
-      { new: true }
+      { returnDocument: 'after' }
     );
 
     if (!claimed) continue;
@@ -383,6 +383,9 @@ export async function dispatchSingleJobNow({ tenantDb, organization, jobId, enti
  */
 export async function processAllOrganizationsFollowUps() {
   try {
+    if (!isDbConnected()) {
+      return;
+    }
     const organizations = await Organization.find();
     for (const org of organizations) {
       try {

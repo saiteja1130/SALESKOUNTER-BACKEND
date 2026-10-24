@@ -21,6 +21,51 @@ function normalizeStatus(status) {
 }
 
 /**
+ * Escapes special characters in string for safe regular expression matching
+ */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Shared server-side authorization check for lead access across all endpoints.
+ * Owners and admins have full access across the organization.
+ * Salespeople are restricted to leads assigned to their TeamMember account or email,
+ * unless granted explicit canViewAllLeads permissions.
+ */
+export async function checkLeadAccess(lead, req, tenantModels) {
+  const isOwnerOrAdmin = req.user?.role === "admin" || req.membership?.role === "owner";
+  if (isOwnerOrAdmin) {
+    return { allowed: true };
+  }
+
+  if (req.membership?.role === "salesperson") {
+    if (Boolean(req.membership?.canViewAllLeads)) {
+      return { allowed: true };
+    }
+
+    const userEmail = req.user?.email ? req.user.email.toLowerCase().trim() : "";
+    const rep = await tenantModels.TeamMember.findOne({ email: userEmail });
+    const repIdStr = rep ? rep._id.toString() : "";
+    const leadAssigneeIdStr = lead.assignedToId ? lead.assignedToId.toString() : "";
+
+    if ((repIdStr && leadAssigneeIdStr === repIdStr) || (userEmail && lead.email === userEmail)) {
+      return { allowed: true };
+    }
+
+    return {
+      allowed: false,
+      message: "Access denied. You can only view and manage leads assigned to your account.",
+    };
+  }
+
+  return {
+    allowed: false,
+    message: "Access denied. Unauthorized to access this lead.",
+  };
+}
+
+/**
  * GET /api/leads
  * Paginated and filtered tenant lead list strictly enforcing server-side salesperson visibility
  */
@@ -65,22 +110,24 @@ export async function listLeads(req, res) {
       }
     }
 
-    // Apply search filter across name, phone, email, and product
-    if (search && search.trim()) {
-      const q = search.trim();
-      const searchRegex = { $regex: q, $options: "i" };
-      const searchCondition = [
-        { name: searchRegex },
-        { phone: searchRegex },
-        { email: searchRegex },
-        { "collectedData.interestedProduct": searchRegex },
-      ];
+    // Apply search filter across name, phone, email, and product (escaped and capped)
+    if (search && typeof search === "string" && search.trim()) {
+      const sanitized = escapeRegex(search.trim().slice(0, 100));
+      if (sanitized) {
+        const searchRegex = { $regex: sanitized, $options: "i" };
+        const searchCondition = [
+          { name: searchRegex },
+          { phone: searchRegex },
+          { email: searchRegex },
+          { "collectedData.interestedProduct": searchRegex },
+        ];
 
-      if (filter.$or) {
-        filter.$and = [{ $or: filter.$or }, { $or: searchCondition }];
-        delete filter.$or;
-      } else {
-        filter.$or = searchCondition;
+        if (filter.$or) {
+          filter.$and = [{ $or: filter.$or }, { $or: searchCondition }];
+          delete filter.$or;
+        } else {
+          filter.$or = searchCondition;
+        }
       }
     }
 
@@ -161,22 +208,13 @@ export async function getLead(req, res) {
       return res.status(404).json({ success: false, message: "Lead not found." });
     }
 
-    // Server-side salesperson authorization
-    if (req.membership?.role === "salesperson") {
-      const canViewAll = Boolean(req.membership?.canViewAllLeads);
-      if (!canViewAll) {
-        const userEmail = req.user.email.toLowerCase().trim();
-        const rep = await tenantModels.TeamMember.findOne({ email: userEmail });
-        const repIdStr = rep ? rep._id.toString() : "";
-        const leadAssigneeIdStr = lead.assignedToId ? lead.assignedToId.toString() : "";
-
-        if (leadAssigneeIdStr !== repIdStr && lead.email !== userEmail) {
-          return res.status(403).json({
-            success: false,
-            message: "Access denied. You can only view leads assigned to your account.",
-          });
-        }
-      }
+    // Shared server-side salesperson authorization check
+    const access = await checkLeadAccess(lead, req, tenantModels);
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: access.message,
+      });
     }
 
     const doc = lead.toObject();
@@ -340,6 +378,13 @@ export async function createLead(req, res) {
     if (quotaReservation && req.tenantModels) {
       await rollbackDailyLeadQuota(req.tenantModels, quotaReservation.todayIST);
     }
+    if (err.code === 11000 || (err.name === "MongoServerError" && err.code === 11000)) {
+      return res.status(409).json({
+        success: false,
+        code: "DUPLICATE_PHONE",
+        message: `A lead with phone number "${req.body?.phone?.trim() || "provided"}" already exists in your workspace pipeline.`,
+      });
+    }
     const isLimitError = err.message && err.message.includes("limit");
     return res.status(isLimitError ? 403 : 400).json({
       success: false,
@@ -376,34 +421,24 @@ export async function updateLead(req, res) {
 
     const isOwnerOrAdmin = req.user?.role === "admin" || req.membership?.role === "owner";
 
-    // Enforce role-based edit permissions
-    if (!isOwnerOrAdmin) {
-      if (req.membership?.role === "salesperson") {
-        const canViewAll = Boolean(req.membership?.canViewAllLeads);
-        const userEmail = req.user.email.toLowerCase().trim();
-        const rep = await tenantModels.TeamMember.findOne({ email: userEmail });
-        const repIdStr = rep ? rep._id.toString() : "";
-        const leadAssigneeIdStr = lead.assignedToId ? lead.assignedToId.toString() : "";
+    // Enforce role-based edit permissions using shared check
+    const access = await checkLeadAccess(lead, req, tenantModels);
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: access.message,
+      });
+    }
 
-        if (!canViewAll && leadAssigneeIdStr !== repIdStr && lead.email !== userEmail) {
-          return res.status(403).json({
-            success: false,
-            message: "You are only authorized to edit leads assigned to you.",
-          });
-        }
-
-        // Salesperson cannot reassign or unassign leads
-        if (assignedToId !== undefined) {
-          const targetRepStr = (!assignedToId || assignedToId === "unassigned") ? "" : assignedToId.toString();
-          if (targetRepStr !== leadAssigneeIdStr) {
-            return res.status(403).json({
-              success: false,
-              message: "Sales representatives cannot reassign leads. Contact your workspace owner.",
-            });
-          }
-        }
-      } else {
-        return res.status(403).json({ success: false, message: "Unauthorized to update leads." });
+    // Salesperson cannot reassign or unassign leads
+    if (!isOwnerOrAdmin && req.membership?.role === "salesperson" && assignedToId !== undefined) {
+      const leadAssigneeIdStr = lead.assignedToId ? lead.assignedToId.toString() : "";
+      const targetRepStr = (!assignedToId || assignedToId === "unassigned") ? "" : assignedToId.toString();
+      if (targetRepStr !== leadAssigneeIdStr) {
+        return res.status(403).json({
+          success: false,
+          message: "Sales representatives cannot reassign leads. Contact your workspace owner.",
+        });
       }
     }
 
@@ -503,6 +538,13 @@ export async function updateLead(req, res) {
     });
   } catch (err) {
     console.error("[Update Lead Error]", err);
+    if (err.code === 11000 || (err.name === "MongoServerError" && err.code === 11000)) {
+      return res.status(409).json({
+        success: false,
+        code: "DUPLICATE_PHONE",
+        message: "A lead with this phone number already exists in your workspace pipeline.",
+      });
+    }
     return res.status(500).json({ success: false, message: "Failed to update lead." });
   }
 }
@@ -810,28 +852,41 @@ export async function getLeadMessages(req, res) {
       return res.status(404).json({ success: false, message: "Lead not found." });
     }
 
+    // Server-side authorization check
+    const access = await checkLeadAccess(lead, req, tenantModels);
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: access.message,
+      });
+    }
+
     const messages = await tenantModels.WhatsAppMessage.find({ leadId: lead._id })
       .sort({ createdAt: 1 })
       .lean();
 
-    const serialized = messages.map((m) => ({
-      id: m._id.toString(),
-      leadId: m.leadId.toString(),
-      sender: m.direction === "inbound" ? "lead" : m.source === "ai" ? "ai" : "salesperson",
-      senderName:
-        m.direction === "inbound"
-          ? lead.name
-          : m.source === "ai"
-          ? "Conversly AI"
-          : "Sales Representative",
-      text: m.body,
-      timestamp: m.createdAt,
-      isDelivered: m.sendStatus === "sent",
-      isRead: true,
-      reactions: m.reactions || [],
-      isEphemeral: Boolean(m.isEphemeral),
-      sendStatus: m.sendStatus,
-    }));
+    const serialized = messages.map((m) => {
+      const deliveryStatus = m.sendStatus === "sent" ? (m.deliveryStatus || "sent") : m.sendStatus;
+      return {
+        id: m._id.toString(),
+        leadId: m.leadId.toString(),
+        sender: m.direction === "inbound" ? "lead" : m.source === "ai" ? "ai" : "salesperson",
+        senderName:
+          m.direction === "inbound"
+            ? lead.name
+            : m.source === "ai"
+            ? "Conversly AI"
+            : "Sales Representative",
+        text: m.body,
+        timestamp: m.createdAt,
+        isDelivered: ["sent", "delivered", "read"].includes(deliveryStatus),
+        isRead: deliveryStatus === "read",
+        reactions: m.reactions || [],
+        isEphemeral: Boolean(m.isEphemeral),
+        sendStatus: m.sendStatus,
+        deliveryStatus,
+      };
+    });
 
     return res.json({
       success: true,
@@ -862,6 +917,21 @@ export async function sendLeadMessage(req, res) {
       return res.status(404).json({ success: false, message: "Lead not found." });
     }
 
+    // Server-side authorization check
+    const access = await checkLeadAccess(lead, req, tenantModels);
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: access.message,
+      });
+    }
+
+    // Pause AI before queueing the human reply so the send worker sees it too.
+    await tenantModels.Lead.updateOne(
+      { _id: lead._id },
+      { $set: { aiPausedUntil: new Date(Date.now() + 5 * 60 * 1000) } }
+    );
+
     const message = await enqueueOutboundMessage({
       leadId: lead._id,
       connectionId: lead.whatsappConnectionId,
@@ -884,6 +954,7 @@ export async function sendLeadMessage(req, res) {
         isDelivered: message.sendStatus === "sent",
         isRead: true,
         sendStatus: message.sendStatus,
+        deliveryStatus: message.sendStatus === "sent" ? (message.deliveryStatus || "sent") : message.sendStatus,
       },
     });
   } catch (err) {

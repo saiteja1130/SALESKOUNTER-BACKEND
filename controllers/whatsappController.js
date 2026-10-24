@@ -115,6 +115,7 @@ export async function startConnectionEndpoint(req, res) {
       connectionId: connection._id,
       tenantModels: req.tenantModels,
       orgId: req.organization._id,
+      ownerUserId: req.user?._id,
     }).catch((err) => {
       console.error(`[WhatsApp Controller] Async start error for ${id}:`, err);
     });

@@ -189,7 +189,7 @@ export async function tryConsumeDailyLeadQuota(tenantModels, entitlements) {
         $inc: { count: 1 },
       },
       {
-        new: true,
+        returnDocument: "after",
       }
     );
 

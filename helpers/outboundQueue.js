@@ -1,9 +1,14 @@
 import crypto from "node:crypto";
 import { getActiveSocket } from "./whatsappManager.js";
 import { emitToOrg } from "./whatsappSocketGateway.js";
+import { Organization } from "../models/platform/Organization.js";
+import { getTenantDB, isDbConnected } from "../configs/db.js";
+import { getTenantModels } from "../models/tenant/schemas.js";
 
 const INSTANCE_ID = `queue_${process.pid}_${crypto.randomBytes(4).toString("hex")}`;
 const MAX_ATTEMPTS = 5;
+let queueWorkerTimer = null;
+let queueWorkerRunning = false;
 
 /**
  * Check if current time falls within tenant quiet hours window
@@ -77,6 +82,7 @@ export async function enqueueOutboundMessage({
     direction: "outbound",
     body,
     sendStatus: "queued",
+    deliveryStatus: "queued",
     source,
     idempotencyKey,
     nextAttemptAt: new Date(),
@@ -107,8 +113,10 @@ export async function drainOutboundQueue({ tenantModels, orgId }) {
   const candidateJobs = await tenantModels.WhatsAppMessage.find({
     direction: "outbound",
     sendStatus: { $in: ["queued", "retryable"] },
-    $or: [{ nextAttemptAt: { $lte: now } }, { nextAttemptAt: null }],
-    $or: [{ leaseUntil: { $lt: now } }, { leaseOwner: "" }, { leaseOwner: null }],
+    $and: [
+      { $or: [{ nextAttemptAt: { $lte: now } }, { nextAttemptAt: null }] },
+      { $or: [{ leaseUntil: { $lt: now } }, { leaseUntil: null }, { leaseOwner: "" }, { leaseOwner: null }] },
+    ],
   })
     .sort({ createdAt: 1 })
     .limit(10);
@@ -121,19 +129,29 @@ export async function drainOutboundQueue({ tenantModels, orgId }) {
       {
         _id: job._id,
         sendStatus: { $in: ["queued", "retryable"] },
-        $or: [{ leaseUntil: { $lt: now } }, { leaseOwner: "" }, { leaseOwner: null }],
+        $and: [
+          { $or: [{ nextAttemptAt: { $lte: now } }, { nextAttemptAt: null }] },
+          { $or: [{ leaseUntil: { $lt: now } }, { leaseUntil: null }, { leaseOwner: "" }, { leaseOwner: null }] },
+        ],
       },
       {
         $set: {
           leaseOwner: INSTANCE_ID,
           leaseUntil: new Date(Date.now() + 30000),
           sendStatus: "sending",
+          deliveryStatus: "sending",
         },
       },
-      { new: true }
+      { returnDocument: 'after' }
     );
 
     if (!claimedJob) continue;
+
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: claimedJob._id,
+      leadId: claimedJob.leadId,
+      sendStatus: "sending",
+    });
 
     try {
       await processOutboundJob({ job: claimedJob, tenantModels, orgId });
@@ -141,6 +159,38 @@ export async function drainOutboundQueue({ tenantModels, orgId }) {
       console.error(`[Outbound Queue] Error processing job ${claimedJob._id}:`, err.message);
     }
   }
+}
+
+/**
+ * Revisit tenant queues so transient failures and jobs left queued while a
+ * WhatsApp socket was offline are retried without waiting for another send.
+ */
+export function startOutboundQueueWorker({ intervalMs = 2500 } = {}) {
+  if (queueWorkerTimer) return queueWorkerTimer;
+
+  const sweep = async () => {
+    if (queueWorkerRunning || !isDbConnected()) return;
+    queueWorkerRunning = true;
+    try {
+      const organizations = await Organization.find({}, { _id: 1, tenantDbName: 1 }).lean();
+      for (const organization of organizations) {
+        try {
+          const tenantModels = getTenantModels(getTenantDB(organization.tenantDbName));
+          await drainOutboundQueue({ tenantModels, orgId: organization._id });
+        } catch (err) {
+          console.warn(`[Outbound Queue] Tenant sweep skipped for ${organization._id}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error("[Outbound Queue] Sweep failed:", err.message);
+    } finally {
+      queueWorkerRunning = false;
+    }
+  };
+
+  sweep().catch(() => {});
+  queueWorkerTimer = setInterval(() => sweep().catch(() => {}), intervalMs);
+  return queueWorkerTimer;
 }
 
 /**
@@ -161,6 +211,12 @@ async function processOutboundJob({ job, tenantModels, orgId }) {
         },
       }
     );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: job.leadId,
+      sendStatus: "failed",
+      error: "Lead document not found",
+    });
     return;
   }
 
@@ -202,6 +258,12 @@ async function processOutboundJob({ job, tenantModels, orgId }) {
         },
       }
     );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: lead._id,
+      sendStatus: "queued",
+      nextAttemptAt: nextRelease,
+    });
     return;
   }
 
@@ -227,25 +289,46 @@ async function processOutboundJob({ job, tenantModels, orgId }) {
         },
       }
     );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: lead._id,
+      sendStatus: "retryable",
+      error: "No WhatsApp connection assigned",
+    });
     return;
   }
 
   const socket = getActiveSocket(connectionId);
   if (!socket) {
-    const attempts = (job.sendAttempts || 0) + 1;
+    const connection = await tenantModels.WhatsAppConnection.findById(connectionId).lean();
+    const connectionUnavailablePermanently = !connection;
+    const attempts = connectionUnavailablePermanently
+      ? (job.sendAttempts || 0) + 1
+      : (job.sendAttempts || 0);
+    const nextStatus = connectionUnavailablePermanently || attempts >= MAX_ATTEMPTS
+      ? "failed"
+      : "retryable";
     await tenantModels.WhatsAppMessage.updateOne(
       { _id: job._id },
       {
         $set: {
-          sendStatus: attempts >= MAX_ATTEMPTS ? "failed" : "retryable",
-          sendAttempts: attempts,
+          sendStatus: nextStatus,
+          deliveryStatus: nextStatus,
+          sendAttempts: connectionUnavailablePermanently ? attempts : job.sendAttempts || 0,
           lastSendError: "WhatsApp socket is not connected or worker is offline",
-          nextAttemptAt: new Date(Date.now() + 20000),
+          nextAttemptAt: nextStatus === "retryable" ? new Date(Date.now() + 5000) : null,
           leaseOwner: "",
           leaseUntil: null,
         },
       }
     );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: lead._id,
+      sendStatus: nextStatus,
+      deliveryStatus: nextStatus,
+      error: "WhatsApp socket is not connected or worker is offline",
+    });
     return;
   }
 
@@ -263,10 +346,31 @@ async function processOutboundJob({ job, tenantModels, orgId }) {
         },
       }
     );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: lead._id,
+      sendStatus: "failed",
+      error: "Invalid recipient phone number",
+    });
     return;
   }
 
   const targetJid = `${rawDigits}@s.whatsapp.net`;
+
+  // A salesperson may take over while an AI response is waiting in the queue.
+  if (job.source === "ai" && lead.aiPausedUntil && lead.aiPausedUntil > new Date()) {
+    await tenantModels.WhatsAppMessage.updateOne(
+      { _id: job._id },
+      { $set: { sendStatus: "suppressed", deliveryStatus: "suppressed", lastSendError: "AI paused after a salesperson reply", leaseOwner: "", leaseUntil: null, nextAttemptAt: null } }
+    );
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: job._id,
+      leadId: lead._id,
+      sendStatus: "suppressed",
+      deliveryStatus: "suppressed",
+    });
+    return;
+  }
 
   // 6. Send message via Baileys socket
   try {
@@ -278,6 +382,7 @@ async function processOutboundJob({ job, tenantModels, orgId }) {
       {
         $set: {
           sendStatus: "sent",
+          deliveryStatus: "sent",
           whatsappMessageId: waMsgId,
           sentAt: new Date(),
           leaseOwner: "",

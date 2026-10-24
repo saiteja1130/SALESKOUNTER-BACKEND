@@ -19,9 +19,6 @@ function extractMessageText(msg) {
 
   if (message.conversation) return message.conversation;
   if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
-  if (message.imageMessage?.caption) return message.imageMessage.caption;
-  if (message.videoMessage?.caption) return message.videoMessage.caption;
-  if (message.documentMessage?.caption) return message.documentMessage.caption;
 
   // Unpack ephemeral and view-once wrappers
   if (message.ephemeralMessage?.message) {
@@ -101,6 +98,73 @@ function createConcurrencyPool(concurrency = 5) {
 }
 
 const pool = createConcurrencyPool(5);
+const aiReplyTimers = new Map();
+const aiReplyInFlight = new Set();
+
+function scheduleAiReply({ leadId, connectionId, tenantModels, orgId, inboundMessageId }) {
+  const key = `${orgId}:${leadId}`;
+  const existing = aiReplyTimers.get(key);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    aiReplyTimers.delete(key);
+    if (aiReplyInFlight.has(key)) {
+      scheduleAiReply({ leadId, connectionId, tenantModels, orgId, inboundMessageId });
+      return;
+    }
+    aiReplyInFlight.add(key);
+    try {
+      const lead = await tenantModels.Lead.findById(leadId);
+      if (!lead || lead.aiHandled === false || lead.whatsappOptOutAt || (lead.aiPausedUntil && lead.aiPausedUntil > new Date())) return;
+
+      const orgDoc = await Organization.findById(orgId);
+      const aiConfigDoc = await tenantModels.AiConfig.findOne({ status: "published" }) || await tenantModels.AiConfig.findOne();
+      const recentMessages = await tenantModels.WhatsAppMessage.find({ leadId })
+        .sort({ createdAt: -1 })
+        .limit(10);
+      const conversationHistory = recentMessages.reverse().map((m) => ({
+        sender: m.direction === "inbound" ? "user" : "ai",
+        text: m.body,
+      }));
+
+      const geminiResult = await testGeminiConversation({
+        organization: orgDoc,
+        tenantDb: tenantModels.Lead.db,
+        config: aiConfigDoc || {},
+        messages: conversationHistory,
+      });
+
+      if (geminiResult?.responseText) {
+        // Use the most recent inbound id so a burst of messages creates one reply.
+        const latestInbound = await tenantModels.WhatsAppMessage.findOne({ leadId, direction: "inbound" }).sort({ createdAt: -1 });
+        const idempotencyId = latestInbound?.whatsappMessageId || inboundMessageId;
+        await enqueueOutboundMessage({
+          leadId,
+          connectionId,
+          body: geminiResult.responseText,
+          idempotencyKey: `ai_reply:${idempotencyId}`,
+          source: "ai",
+          tenantModels,
+          orgId,
+        });
+
+        if (geminiResult.extractedData && Object.keys(geminiResult.extractedData).length > 0) {
+          const updates = {};
+          for (const [field, value] of Object.entries(geminiResult.extractedData)) updates[`collectedData.${field}`] = value;
+          await tenantModels.Lead.updateOne({ _id: leadId }, { $set: updates });
+          emitToOrg(orgId, "whatsapp:lead_updated", { leadId, collectedData: geminiResult.extractedData });
+        }
+      }
+    } catch (aiErr) {
+      console.warn(`[Message Handler] AI reply generation skipped for ${leadId}:`, aiErr.message);
+    } finally {
+      aiReplyInFlight.delete(key);
+    }
+  }, 1800);
+
+  timer.unref?.();
+  aiReplyTimers.set(key, timer);
+}
 
 /**
  * Main Baileys messages.upsert handler
@@ -143,22 +207,47 @@ async function processSingleMessage({ msg, connectionId, tenantModels, orgId }) 
     if (!normalizedPhone || !rawText) return;
     const existingLead = await tenantModels.Lead.findOne({ phone: normalizedPhone });
     if (existingLead) {
-      await tenantModels.WhatsAppMessage.create({
-        leadId: existingLead._id,
-        connectionId,
-        direction: "outbound",
-        body: rawText,
-        whatsappMessageId: waMessageId,
-        sendStatus: "sent",
-        source: "manual",
-        sentAt: new Date(),
-      });
-      emitToOrg(orgId, "whatsapp:message_updated", {
-        leadId: existingLead._id,
-        direction: "outbound",
-        body: rawText,
-        source: "manual",
-      });
+      const knownMessage = await tenantModels.WhatsAppMessage.findOne({ connectionId, whatsappMessageId: waMessageId });
+      if (!knownMessage) {
+        const pendingOutbound = await tenantModels.WhatsAppMessage.findOneAndUpdate(
+          {
+            leadId: existingLead._id,
+            connectionId,
+            direction: "outbound",
+            body: rawText,
+            whatsappMessageId: "",
+            sendStatus: { $in: ["queued", "sending", "sent"] },
+            createdAt: { $gte: new Date(Date.now() - 2 * 60 * 1000) },
+          },
+          { $set: { whatsappMessageId: waMessageId, sendStatus: "sent", deliveryStatus: "sent", sentAt: new Date() } },
+          { sort: { createdAt: -1 }, returnDocument: "after" }
+        );
+        const savedMessage = pendingOutbound || await tenantModels.WhatsAppMessage.create({
+          leadId: existingLead._id,
+          connectionId,
+          direction: "outbound",
+          body: rawText,
+          whatsappMessageId: waMessageId,
+          sendStatus: "sent",
+          deliveryStatus: "sent",
+          source: "manual",
+          sentAt: new Date(),
+        });
+        emitToOrg(orgId, pendingOutbound ? "whatsapp:message_updated" : "whatsapp:message_received", {
+          messageId: savedMessage._id,
+          leadId: existingLead._id,
+          direction: "outbound",
+          body: rawText,
+          source: pendingOutbound ? savedMessage.source : "manual",
+          sendStatus: "sent",
+          deliveryStatus: "sent",
+          whatsappMessageId: waMessageId,
+        });
+      }
+      await tenantModels.Lead.updateOne(
+        { _id: existingLead._id },
+        { $set: { aiPausedUntil: new Date(Date.now() + 5 * 60 * 1000), lastContactAt: new Date() } }
+      );
     }
     return;
   }
@@ -174,7 +263,7 @@ async function processSingleMessage({ msg, connectionId, tenantModels, orgId }) 
       remoteJid: jid,
       fromPhone: normalizedPhone,
       messageType: rawText ? "text" : "other",
-      rawText: rawText || "[Media or attachment]",
+      rawText,
       processingStatus: "pending",
       isEphemeral: Boolean(ephemeralExpiry),
       ephemeralExpiry: ephemeralExpiry || 0,
@@ -186,6 +275,20 @@ async function processSingleMessage({ msg, connectionId, tenantModels, orgId }) 
       return;
     }
     throw err;
+  }
+
+  // This integration intentionally supports plain text messages only.
+  if (!rawText) {
+    await tenantModels.WhatsAppInboxEvent.updateOne(
+      { _id: inboxEvent._id },
+      {
+        $set: {
+          processingStatus: "ignored",
+          errorMessage: "Only plain text WhatsApp messages are supported.",
+        },
+      }
+    );
+    return;
   }
 
   // 4. Opt-out keyword detection
@@ -297,64 +400,15 @@ async function processSingleMessage({ msg, connectionId, tenantModels, orgId }) 
     isEphemeral: Boolean(ephemeralExpiry),
   });
 
-  // 7. Automated AI Qualification & Response Generation
+  // Debounce rapid inbound messages so each burst gets one contextual reply.
   if (
     !isOptOutKeyword &&
     lead.aiHandled !== false &&
     !lead.whatsappOptOutAt &&
+    (!lead.aiPausedUntil || lead.aiPausedUntil <= new Date()) &&
     rawText.length > 0
   ) {
-    try {
-      const orgDoc = await Organization.findById(orgId);
-      const aiConfigDoc = await tenantModels.AiConfig.findOne({ status: "published" }) || await tenantModels.AiConfig.findOne();
-
-      // Retrieve recent conversation history for context
-      const recentMessages = await tenantModels.WhatsAppMessage.find({
-        leadId: lead._id,
-      })
-        .sort({ createdAt: -1 })
-        .limit(10);
-
-      const conversationHistory = recentMessages.reverse().map((m) => ({
-        sender: m.direction === "inbound" ? "user" : "ai",
-        text: m.body,
-      }));
-
-      const geminiResult = await testGeminiConversation({
-        organization: orgDoc,
-        tenantDb: tenantModels.Lead.db,
-        config: aiConfigDoc || {},
-        messages: conversationHistory,
-      });
-
-      if (geminiResult?.responseText) {
-        // Enqueue AI response via persistent outbound worker
-        await enqueueOutboundMessage({
-          leadId: lead._id,
-          connectionId,
-          body: geminiResult.responseText,
-          idempotencyKey: `ai_reply:${waMessageId}`,
-          source: "ai",
-          tenantModels,
-          orgId,
-        });
-
-        // If qualification data was extracted, persist to lead
-        if (geminiResult.extractedData && Object.keys(geminiResult.extractedData).length > 0) {
-          const updates = {};
-          for (const [key, val] of Object.entries(geminiResult.extractedData)) {
-            updates[`collectedData.${key}`] = val;
-          }
-          await tenantModels.Lead.updateOne({ _id: lead._id }, { $set: updates });
-          emitToOrg(orgId, "whatsapp:lead_updated", {
-            leadId: lead._id,
-            collectedData: geminiResult.extractedData,
-          });
-        }
-      }
-    } catch (aiErr) {
-      console.warn(`[Message Handler] AI reply generation skipped for ${lead._id}:`, aiErr.message);
-    }
+    scheduleAiReply({ leadId: lead._id, connectionId, tenantModels, orgId, inboundMessageId: waMessageId });
   }
 }
 
@@ -411,6 +465,45 @@ export async function handleReactionEvent({ reactions, connectionId, tenantModel
       targetMessageId: targetMsgId,
       actor,
       emoji,
+    });
+  }
+}
+
+/** Persist Baileys outbound delivery/read acknowledgements and notify inbox clients. */
+export async function handleMessageUpdateEvent({ updates, connectionId, tenantModels, orgId }) {
+  if (!Array.isArray(updates)) return;
+
+  for (const { key, update } of updates) {
+    const messageId = key?.id;
+    const rawStatus = Number(update?.status);
+    if (!messageId || !Number.isFinite(rawStatus)) continue;
+
+    const deliveryStatus = rawStatus >= 3
+      ? "read"
+      : rawStatus === 2
+        ? "delivered"
+        : rawStatus === 1
+          ? "sent"
+          : null;
+    if (!deliveryStatus) continue;
+
+    const result = await tenantModels.WhatsAppMessage.updateOne(
+      { connectionId, whatsappMessageId: messageId, direction: "outbound" },
+      { $set: { deliveryStatus } }
+    );
+    if (!result.matchedCount) continue;
+
+    const message = await tenantModels.WhatsAppMessage.findOne(
+      { connectionId, whatsappMessageId: messageId, direction: "outbound" },
+      { _id: 1, leadId: 1 }
+    ).lean();
+
+    emitToOrg(orgId, "whatsapp:message_updated", {
+      messageId: message?._id,
+      whatsappMessageId: messageId,
+      leadId: message?.leadId,
+      sendStatus: "sent",
+      deliveryStatus,
     });
   }
 }

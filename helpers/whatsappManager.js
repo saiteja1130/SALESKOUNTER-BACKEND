@@ -1,13 +1,19 @@
 import crypto from "node:crypto";
-import makeWASocket, { DisconnectReason, BufferJSON, initAuthCreds } from "@whiskeysockets/baileys";
+import makeWASocket, {
+  DisconnectReason,
+  BufferJSON,
+  initAuthCreds,
+  proto,
+  makeCacheableSignalKeyStore,
+} from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { getWhatsAppEncryptionSecret, encryptSecret, decryptSecret } from "./crypto.js";
-import { emitToOrg } from "./whatsappSocketGateway.js";
-import { handleMessagesUpsert, handleReactionEvent, handleMessageDeleteEvent } from "./messageHandler.js";
+import { emitToOrg, emitToUser } from "./whatsappSocketGateway.js";
+import { handleMessagesUpsert, handleReactionEvent, handleMessageUpdateEvent, handleMessageDeleteEvent } from "./messageHandler.js";
 import { Organization } from "../models/platform/Organization.js";
 import { Subscription } from "../models/platform/Subscription.js";
 import { computeEntitlements } from "./entitlements.js";
-import { getTenantDB } from "../configs/db.js";
+import { getTenantDB, isDbConnected } from "../configs/db.js";
 import { getTenantModels } from "../models/tenant/schemas.js";
 
 // Unique worker process instance identifier for distributed leases
@@ -17,12 +23,21 @@ const LEASE_HEARTBEAT_MS = 10000;
 
 // In-process active worker cache
 const activeWorkers = new Map();
+let watchdogTimer = null;
 
 /**
  * Build database-backed Baileys authentication state with AES-256-GCM encryption
  */
 async function buildDBAuthState(tenantModels, connectionId) {
   const encryptionSecret = getWhatsAppEncryptionSecret();
+  // Baileys emits credential and Signal-key updates concurrently. Serialize
+  // writes per connection so older snapshots cannot overwrite newer state.
+  let authWriteQueue = Promise.resolve();
+  const enqueueAuthWrite = (write) => {
+    const pending = authWriteQueue.then(write, write);
+    authWriteQueue = pending.catch(() => {});
+    return pending;
+  };
 
   // Load existing credentials or initialize clean credentials
   const authStateDoc = await tenantModels.WhatsAppAuthState.findOne({ connectionId });
@@ -33,43 +48,36 @@ async function buildDBAuthState(tenantModels, connectionId) {
       const decrypted = decryptSecret(authStateDoc.encryptedCreds, encryptionSecret);
       creds = JSON.parse(decrypted, BufferJSON.reviver);
     } catch (err) {
-      console.warn(`[WA Auth] Failed to decrypt creds for connection ${connectionId}, reinitializing:`, err.message);
-      creds = initAuthCreds();
+      throw new Error(`Stored WhatsApp credentials could not be decrypted for connection ${connectionId}: ${err.message}`);
     }
   } else {
     creds = initAuthCreds();
   }
 
   // Define keys store backed by WhatsAppAuthKey collection
-  const keys = {
+  const baseKeys = {
     get: async (type, ids) => {
       const result = {};
-      try {
-        const keyDocs = await tenantModels.WhatsAppAuthKey.find({
-          connectionId,
-          keyType: type,
-          keyId: { $in: ids },
-        });
+      const stringIds = ids.map((id) => String(id));
+      const keyDocs = await tenantModels.WhatsAppAuthKey.find({
+        connectionId,
+        keyType: type,
+        keyId: { $in: stringIds },
+      });
 
-        for (const doc of keyDocs) {
-          if (!doc.encryptedValue) continue;
-          try {
-            const decrypted = decryptSecret(doc.encryptedValue, encryptionSecret);
-            if (decrypted) {
-              result[doc.keyId] = JSON.parse(decrypted, BufferJSON.reviver);
-            }
-          } catch (err) {
-            console.error(`[WA Auth] Error decrypting key ${type}:${doc.keyId}:`, err.message);
-          }
+      for (const doc of keyDocs) {
+        if (!doc.encryptedValue) continue;
+        const decrypted = decryptSecret(doc.encryptedValue, encryptionSecret);
+        let parsed = JSON.parse(decrypted, BufferJSON.reviver);
+        if (type === "app-state-sync-key" && parsed) {
+          parsed = proto.Message.AppStateSyncKeyData.fromObject(parsed);
         }
-      } catch (err) {
-        console.error(`[WA Auth] Error in keys.get (${type}):`, err.message);
+        result[doc.keyId] = parsed;
       }
       return result;
     },
 
-    set: async (data) => {
-      try {
+    set: async (data) => enqueueAuthWrite(async () => {
         const operations = [];
         for (const type of Object.keys(data)) {
           for (const keyId of Object.keys(data[type])) {
@@ -78,7 +86,7 @@ async function buildDBAuthState(tenantModels, connectionId) {
               // Delete key
               operations.push({
                 deleteOne: {
-                  filter: { connectionId, keyType: type, keyId },
+                  filter: { connectionId, keyType: type, keyId: String(keyId) },
                 },
               });
             } else {
@@ -87,7 +95,7 @@ async function buildDBAuthState(tenantModels, connectionId) {
               const encryptedValue = encryptSecret(serialized, encryptionSecret);
               operations.push({
                 updateOne: {
-                  filter: { connectionId, keyType: type, keyId },
+                  filter: { connectionId, keyType: type, keyId: String(keyId) },
                   update: { $set: { encryptedValue } },
                   upsert: true,
                 },
@@ -99,14 +107,12 @@ async function buildDBAuthState(tenantModels, connectionId) {
         if (operations.length > 0) {
           await tenantModels.WhatsAppAuthKey.bulkWrite(operations);
         }
-      } catch (err) {
-        console.error(`[WA Auth] Error in keys.set:`, err.message);
-      }
-    },
+    }),
   };
 
-  const saveCreds = async () => {
-    try {
+  const keys = makeCacheableSignalKeyStore(baseKeys);
+
+  const saveCreds = async () => enqueueAuthWrite(async () => {
       const serialized = JSON.stringify(creds, BufferJSON.replacer);
       const encryptedCreds = encryptSecret(serialized, encryptionSecret);
       await tenantModels.WhatsAppAuthState.updateOne(
@@ -114,10 +120,7 @@ async function buildDBAuthState(tenantModels, connectionId) {
         { $set: { encryptedCreds } },
         { upsert: true }
       );
-    } catch (err) {
-      console.error(`[WA Auth] Error saving credentials for ${connectionId}:`, err.message);
-    }
-  };
+    });
 
   return {
     state: {
@@ -151,7 +154,7 @@ async function acquireLease(tenantModels, connectionId) {
         leaseUntil: leaseUntil,
       },
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
 
   return Boolean(doc);
@@ -217,17 +220,17 @@ function cleanupWorker(connectionId) {
 /**
  * Start Baileys connection with database auth, lease ownership, and QR streaming
  */
-export async function startConnection({ connectionId, tenantModels, orgId }) {
+export async function startConnection({ connectionId, tenantModels, orgId, ownerUserId }) {
   const workerKey = connectionId.toString();
 
   // Check if active worker is already running and connected
   const existingWorker = activeWorkers.get(workerKey);
-  if (existingWorker?.socket) {
+  if (existingWorker) {
     const connDoc = await tenantModels.WhatsAppConnection.findById(connectionId);
-    if (connDoc?.status === "connected") {
+    if (existingWorker.socket && existingWorker.connected && connDoc?.status === "connected") {
       return { status: "connected", linkedPhone: connDoc.linkedPhone };
     }
-    // If not connected, clean up stale worker
+    // Remove stale local state before acquiring/refreshing its lease.
     cleanupWorker(connectionId);
   }
 
@@ -249,32 +252,54 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
 
   const worker = {
     socket: null,
+    connected: false,
     qr: null,
     qrExpiresAt: null,
     heartbeatTimer: null,
     reconnectTimer: null,
     stoppedIntentionally: false,
     orgId,
+    ownerUserId: ownerUserId?.toString() || "",
     tenantModels,
   };
   activeWorkers.set(workerKey, worker);
   startHeartbeat(worker, tenantModels, connectionId);
 
-  const { state, saveCreds } = await buildDBAuthState(tenantModels, connectionId);
+  let state;
+  let saveCreds;
+  let socket;
+  try {
+    ({ state, saveCreds } = await buildDBAuthState(tenantModels, connectionId));
 
-  // Initialize Baileys socket with history sync explicitly disabled
-  const socket = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    browser: ["Conversly AI", "Chrome", "1.0.0"],
-    syncFullHistory: false, // Critical decision: history sync DISABLED
-    markOnlineOnConnect: true,
-  });
+    // Initialize Baileys socket with history sync explicitly disabled.
+    socket = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      browser: ["Conversly AI", "Chrome", "1.0.0"],
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      keepAliveIntervalMs: 20000,
+      connectTimeoutMs: 60000,
+    });
+  } catch (err) {
+    cleanupWorker(connectionId);
+    await releaseLease(tenantModels, connectionId);
+    await tenantModels.WhatsAppConnection.updateOne(
+      { _id: connectionId },
+      { $set: { status: "failed", disconnectedAt: new Date(), lastDisconnectReason: err.message || "Failed to initialize WhatsApp socket" } }
+    );
+    emitToOrg(orgId, "whatsapp:connection_status", { connectionId, status: "failed", reason: err.message || "Failed to initialize WhatsApp socket" });
+    throw err;
+  }
 
   worker.socket = socket;
 
   // Persist auth credentials on update
-  socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("creds.update", () => {
+    saveCreds().catch((err) => {
+      console.error(`[WA Auth] Failed to persist credentials for ${connectionId}:`, err.message);
+    });
+  });
 
   // Connection lifecycle handler
   socket.ev.on("connection.update", async (update) => {
@@ -310,16 +335,27 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
         console.error("[WA Manager] Error generating QR data URL:", err.message);
       }
 
-      emitToOrg(orgId, "whatsapp:qr_updated", {
+      emitToUser(worker.ownerUserId, "whatsapp:qr_updated", {
         connectionId,
-        qr,
         qrDataUrl,
         expiresAt,
       });
     }
 
+    if (connection === "connecting") {
+      await tenantModels.WhatsAppConnection.updateOne(
+        { _id: connectionId },
+        { $set: { status: "connecting", qrExpiresAt: worker.qrExpiresAt || null } }
+      );
+      emitToOrg(orgId, "whatsapp:connection_status", {
+        connectionId,
+        status: "connecting",
+      });
+    }
+
     // Handle connected (open)
     if (connection === "open") {
+      worker.connected = true;
       worker.qr = null;
       worker.qrExpiresAt = null;
 
@@ -358,12 +394,15 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
 
     // Handle disconnect (close)
     if (connection === "close") {
+      worker.connected = false;
       worker.qr = null;
       worker.qrExpiresAt = null;
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
       const isReplaced = statusCode === DisconnectReason.connectionReplaced;
+      const isQrTimeout = statusCode === 408;
+      const isRestartRequired = statusCode === DisconnectReason.restartRequired;
 
       console.warn(`[WA Manager] Connection ${connectionId} CLOSED. Code: ${statusCode}, Intentionally stopped: ${worker.stoppedIntentionally}`);
 
@@ -441,6 +480,19 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
         return;
       }
 
+      // A QR that was never scanned expires normally. Stop and wait for the
+      // user to request a fresh QR instead of reconnecting forever.
+      if (isQrTimeout && !state.creds.registered) {
+        await tenantModels.WhatsAppConnection.updateOne(
+          { _id: connectionId },
+          { $set: { status: "disconnected", disconnectedAt: new Date(), lastDisconnectReason: "QR code expired; request a new QR code", requiresNewQR: true, qrExpiresAt: null } }
+        );
+        emitToOrg(orgId, "whatsapp:connection_status", { connectionId, status: "disconnected", requiresNewQR: true, reason: "QR code expired. Start the connection again to generate a new QR code." });
+        await releaseLease(tenantModels, connectionId);
+        cleanupWorker(connectionId);
+        return;
+      }
+
       // Transient failure -> Exponential backoff reconnect
       const connDoc = await tenantModels.WhatsAppConnection.findById(connectionId);
       const attempts = (connDoc?.reconnectAttempts || 0) + 1;
@@ -468,7 +520,7 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
         return;
       }
 
-      const delay = Math.min(2000 * Math.pow(2, attempts - 1), 60000);
+      const delay = isRestartRequired ? 250 : Math.min(2000 * Math.pow(2, attempts - 1), 60000);
       await tenantModels.WhatsAppConnection.updateOne(
         { _id: connectionId },
         {
@@ -489,7 +541,7 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
       });
 
       worker.reconnectTimer = setTimeout(() => {
-        startConnection({ connectionId, tenantModels, orgId }).catch((err) => {
+        startConnection({ connectionId, tenantModels, orgId, ownerUserId: worker.ownerUserId }).catch((err) => {
           console.error(`[WA Manager] Reconnect error for ${connectionId}:`, err.message);
         });
       }, delay);
@@ -518,6 +570,12 @@ export async function startConnection({ connectionId, tenantModels, orgId }) {
       orgId,
     }).catch((err) => {
       console.error(`[WA Manager] reaction processing error for ${connectionId}:`, err);
+    });
+  });
+
+  socket.ev.on("messages.update", (updates) => {
+    handleMessageUpdateEvent({ updates, connectionId, tenantModels, orgId }).catch((err) => {
+      console.error(`[WA Manager] message update processing error for ${connectionId}:`, err);
     });
   });
 
@@ -614,7 +672,7 @@ export function getWorkerStatus(connectionId) {
  */
 export function getActiveSocket(connectionId) {
   const worker = activeWorkers.get(connectionId.toString());
-  return worker?.socket || null;
+  return worker?.connected ? worker.socket : null;
 }
 
 /**
@@ -622,6 +680,10 @@ export function getActiveSocket(connectionId) {
  */
 export async function restoreActiveConnections() {
   try {
+    if (!isDbConnected()) {
+      console.log("[WA Manager] MongoDB is not connected. Skipping connection restoration on boot.");
+      return;
+    }
     const orgs = await Organization.find({});
     console.log(`[WA Manager] Checking connections across ${orgs.length} organization(s)...`);
 
@@ -649,7 +711,7 @@ export async function restoreActiveConnections() {
           const hasAuth = await tenantModels.WhatsAppAuthState.findOne({ connectionId: conn._id });
           if (hasAuth && hasAuth.encryptedCreds) {
             console.log(`[WA Manager] Restoring connection ${conn._id} (${conn.displayName}) for org ${org.name}`);
-            startConnection({ connectionId: conn._id, tenantModels, orgId: org._id }).catch((err) => {
+            startConnection({ connectionId: conn._id, tenantModels, orgId: org._id, ownerUserId: org.ownerId }).catch((err) => {
               console.error(`[WA Manager] Failed to restore connection ${conn._id}:`, err.message);
             });
           } else {
@@ -667,4 +729,37 @@ export async function restoreActiveConnections() {
   } catch (err) {
     console.error("[WA Manager] Fatal error in restoreActiveConnections:", err.message);
   }
+}
+
+/** Recover connections whose owning process disappeared without a close event. */
+export function startWhatsAppWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(async () => {
+    if (!isDbConnected()) return;
+    try {
+      const now = new Date();
+      const orgs = await Organization.find({});
+      for (const org of orgs) {
+        try {
+          const tenantModels = getTenantModels(getTenantDB(org.tenantDbName));
+          const staleConnections = await tenantModels.WhatsAppConnection.find({
+            status: { $in: ["connected", "connecting", "reconnecting"] },
+            $or: [{ leaseUntil: null }, { leaseUntil: { $lt: now } }, { leaseOwner: "" }],
+          }).limit(25);
+          for (const connection of staleConnections) {
+            if (activeWorkers.has(connection._id.toString())) continue;
+            const auth = await tenantModels.WhatsAppAuthState.findOne({ connectionId: connection._id });
+            if (!auth?.encryptedCreds) continue;
+            startConnection({ connectionId: connection._id, tenantModels, orgId: org._id, ownerUserId: org.ownerId })
+              .catch((err) => console.warn(`[WA Watchdog] Recovery deferred for ${connection._id}:`, err.message));
+          }
+        } catch (orgErr) {
+          console.warn(`[WA Watchdog] Scan failed for org ${org._id}:`, orgErr.message);
+        }
+      }
+    } catch (err) {
+      console.error("[WA Watchdog] Scan failed:", err.message);
+    }
+  }, 30000);
+  watchdogTimer.unref?.();
 }
