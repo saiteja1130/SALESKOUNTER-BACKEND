@@ -2,26 +2,295 @@ import mongoose from "mongoose";
 
 export const whatsAppConnectionSchema = new mongoose.Schema(
   {
-    phoneNumber: {
-      type: String,
-      required: true,
-      trim: true,
-    },
     displayName: {
       type: String,
       default: "WhatsApp Business Line",
     },
     status: {
       type: String,
-      enum: ["connected", "disconnected", "pairing"],
-      default: "connected",
+      enum: [
+        "disconnected",
+        "initializing",
+        "qr_pending",
+        "connecting",
+        "connected",
+        "reconnecting",
+        "logged_out",
+        "failed",
+        "disconnecting",
+      ],
+      default: "disconnected",
+      index: true,
+    },
+    phoneNumber: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    linkedPhone: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    linkedName: {
+      type: String,
+      default: "",
     },
     connectedAt: {
+      type: Date,
+      default: null,
+    },
+    disconnectedAt: {
+      type: Date,
+      default: null,
+    },
+    lastSeen: {
+      type: Date,
+      default: null,
+    },
+    lastDisconnectReason: {
+      type: String,
+      default: "",
+    },
+    requiresNewQR: {
+      type: Boolean,
+      default: false,
+    },
+    qrExpiresAt: {
+      type: Date,
+      default: null,
+    },
+    reconnectAttempts: {
+      type: Number,
+      default: 0,
+    },
+    leaseOwner: {
+      type: String,
+      default: "",
+    },
+    leaseUntil: {
+      type: Date,
+      default: null,
+    },
+  },
+  { timestamps: true }
+);
+
+export const whatsAppAuthStateSchema = new mongoose.Schema(
+  {
+    connectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+      index: true,
+      unique: true,
+    },
+    encryptedCreds: {
+      type: String,
+      default: "",
+    },
+  },
+  { timestamps: true }
+);
+
+export const whatsAppAuthKeySchema = new mongoose.Schema(
+  {
+    connectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+      index: true,
+    },
+    keyType: {
+      type: String,
+      required: true,
+    },
+    keyId: {
+      type: String,
+      required: true,
+    },
+    encryptedValue: {
+      type: String,
+      default: "",
+    },
+  },
+  { timestamps: true }
+);
+whatsAppAuthKeySchema.index({ connectionId: 1, keyType: 1, keyId: 1 }, { unique: true });
+
+export const whatsAppInboxEventSchema = new mongoose.Schema(
+  {
+    connectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      index: true,
+    },
+    whatsappMessageId: {
+      type: String,
+      required: true,
+    },
+    remoteJid: {
+      type: String,
+    },
+    fromPhone: {
+      type: String,
+    },
+    messageType: {
+      type: String,
+      enum: ["text", "image", "audio", "document", "sticker", "reaction", "other"],
+      default: "text",
+    },
+    rawText: {
+      type: String,
+      default: "",
+    },
+    processingStatus: {
+      type: String,
+      enum: ["pending", "processing", "processed", "quota_blocked", "ignored", "retryable", "failed"],
+      default: "pending",
+      index: true,
+    },
+    leadId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+    errorMessage: {
+      type: String,
+      default: "",
+    },
+    leaseOwner: {
+      type: String,
+      default: "",
+    },
+    leaseUntil: {
+      type: Date,
+      default: null,
+    },
+    attemptCount: {
+      type: Number,
+      default: 0,
+    },
+    nextAttemptAt: {
+      type: Date,
+      default: null,
+    },
+    isEphemeral: {
+      type: Boolean,
+      default: false,
+    },
+    ephemeralExpiry: {
+      type: Number,
+      default: 0,
+    },
+    reactionEmoji: {
+      type: String,
+      default: "",
+    },
+    reactedToMessageId: {
+      type: String,
+      default: "",
+    },
+    receivedAt: {
       type: Date,
       default: () => new Date(),
     },
   },
   { timestamps: true }
+);
+whatsAppInboxEventSchema.index(
+  { connectionId: 1, remoteJid: 1, whatsappMessageId: 1 },
+  { unique: true }
+);
+
+export const whatsAppMessageSchema = new mongoose.Schema(
+  {
+    leadId: {
+      type: mongoose.Schema.Types.ObjectId,
+      index: true,
+      required: true,
+    },
+    connectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      index: true,
+    },
+    direction: {
+      type: String,
+      enum: ["inbound", "outbound"],
+      required: true,
+    },
+    body: {
+      type: String,
+      default: "",
+    },
+    whatsappMessageId: {
+      type: String,
+      default: "",
+      index: true,
+    },
+    sendStatus: {
+      type: String,
+      enum: ["queued", "sending", "sent", "failed", "retryable", "uncertain", "suppressed"],
+      default: "queued",
+      index: true,
+    },
+    source: {
+      type: String,
+      enum: ["ai", "follow_up", "campaign", "manual", "inbound"],
+      default: "manual",
+    },
+    sendAttempts: {
+      type: Number,
+      default: 0,
+    },
+    lastSendError: {
+      type: String,
+      default: "",
+    },
+    idempotencyKey: {
+      type: String,
+      default: undefined,
+      index: true,
+    },
+    leaseOwner: {
+      type: String,
+      default: "",
+    },
+    leaseUntil: {
+      type: Date,
+      default: null,
+    },
+    nextAttemptAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    reactions: [
+      {
+        actorJid: String,
+        emoji: String,
+        addedAt: { type: Date, default: () => new Date() },
+        removedAt: { type: Date, default: null },
+      },
+    ],
+    isEphemeral: {
+      type: Boolean,
+      default: false,
+    },
+    ephemeralExpiry: {
+      type: Number,
+      default: 0,
+    },
+    ephemeralExpiresAt: {
+      type: Date,
+      default: null,
+    },
+    sentAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  { timestamps: true }
+);
+whatsAppMessageSchema.index(
+  { connectionId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } }
 );
 
 export const teamMemberSchema = new mongoose.Schema(
@@ -152,6 +421,15 @@ export const leadSchema = new mongoose.Schema(
     needsAttention: {
       type: Boolean,
       default: false,
+    },
+    whatsappOptOutAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    whatsappOptOutReason: {
+      type: String,
+      default: "",
     },
   },
   { timestamps: true }
@@ -526,5 +804,17 @@ export function getTenantModels(tenantDb) {
     AiConfig:
       tenantDb.models.AiConfig ||
       tenantDb.model("AiConfig", aiConfigSchema),
+    WhatsAppAuthState:
+      tenantDb.models.WhatsAppAuthState ||
+      tenantDb.model("WhatsAppAuthState", whatsAppAuthStateSchema),
+    WhatsAppAuthKey:
+      tenantDb.models.WhatsAppAuthKey ||
+      tenantDb.model("WhatsAppAuthKey", whatsAppAuthKeySchema),
+    WhatsAppInboxEvent:
+      tenantDb.models.WhatsAppInboxEvent ||
+      tenantDb.model("WhatsAppInboxEvent", whatsAppInboxEventSchema),
+    WhatsAppMessage:
+      tenantDb.models.WhatsAppMessage ||
+      tenantDb.model("WhatsAppMessage", whatsAppMessageSchema),
   };
 }

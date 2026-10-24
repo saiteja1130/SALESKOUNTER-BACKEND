@@ -109,9 +109,8 @@ export async function assertCanAddConnection(tenantModels, entitlements) {
   if (entitlements.isReadOnly || entitlements.isExpired) {
     throw new Error("Subscription is expired or inactive. Adding WhatsApp connections is blocked.");
   }
-  const currentCount = await tenantModels.WhatsAppConnection.countDocuments({
-    status: { $ne: "disconnected" },
-  });
+  // Every retained connection document occupies a plan connection slot
+  const currentCount = await tenantModels.WhatsAppConnection.countDocuments({});
   if (currentCount >= entitlements.maxConnections) {
     throw new Error(
       `Connection limit reached. Your ${entitlements.plan.toUpperCase()} plan allows up to ${entitlements.maxConnections} WhatsApp connection(s). Please upgrade to add more.`

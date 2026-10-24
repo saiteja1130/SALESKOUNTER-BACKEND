@@ -3,6 +3,7 @@ import { Organization } from "../models/platform/Organization.js";
 import { Subscription } from "../models/platform/Subscription.js";
 import { computeEntitlements } from "./entitlements.js";
 import { getTenantDB } from "../configs/db.js";
+import { enqueueOutboundMessage } from "./outboundQueue.js";
 
 /**
  * Follow-up Engine: Cadence Evaluation, Quiet-Hours Windowing, and Atomic Execution
@@ -292,7 +293,19 @@ export async function executeDueFollowUps({ tenantDb, organization, entitlements
         continue;
       }
 
-      // Simulate sending WhatsApp message / record outbound message
+      // Enqueue real WhatsApp message via persistent outbound worker
+      if (claimed.messagePreview) {
+        await enqueueOutboundMessage({
+          leadId: lead._id,
+          connectionId: lead.whatsappConnectionId,
+          body: claimed.messagePreview,
+          idempotencyKey: `followup:${claimed._id}`,
+          source: "follow_up",
+          tenantModels: getTenantModels(tenantDb),
+          orgId: organization._id,
+        });
+      }
+
       lead.lastContactAt = new Date();
       await lead.save();
 
@@ -339,7 +352,16 @@ export async function dispatchSingleJobNow({ tenantDb, organization, jobId, enti
   }
 
   const lead = await Lead.findById(job.leadId);
-  if (lead) {
+  if (lead && job.messagePreview) {
+    await enqueueOutboundMessage({
+      leadId: lead._id,
+      connectionId: lead.whatsappConnectionId,
+      body: job.messagePreview,
+      idempotencyKey: `followup:${job._id}:manual`,
+      source: "follow_up",
+      tenantModels: getTenantModels(tenantDb),
+      orgId: organization._id,
+    });
     lead.lastContactAt = new Date();
     await lead.save();
   }

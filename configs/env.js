@@ -40,4 +40,5 @@ export const env = {
   SESSION_COOKIE_NAME: process.env.SESSION_COOKIE_NAME || "conversly_session",
   SESSION_MAX_AGE_DAYS: parseInt(process.env.SESSION_MAX_AGE_DAYS || "7", 10),
   EMAIL_FROM: process.env.EMAIL_FROM || "no-reply@conversly.ai",
+  WHATSAPP_ENCRYPTION_SECRET: process.env.WHATSAPP_ENCRYPTION_SECRET || "conversly_wa_auth_encryption_secret_key_2026_dev",
 };

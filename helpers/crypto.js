@@ -97,4 +97,6 @@ export function decryptSecret(encryptedPayload, secret = process.env.SESSION_SEC
     return "";
   }
 }
-
+export function getWhatsAppEncryptionSecret() {
+  return process.env.WHATSAPP_ENCRYPTION_SECRET || process.env.SESSION_SECRET || "conversly_wa_auth_encryption_secret_key_2026_dev";
+}

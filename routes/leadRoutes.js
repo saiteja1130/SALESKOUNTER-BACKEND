@@ -10,6 +10,8 @@ import {
   bulkStatusUpdate,
   deleteLead,
   listTeamMembers,
+  getLeadMessages,
+  sendLeadMessage,
 } from "../controllers/leadController.js";
 
 const router = Router();
@@ -22,6 +24,8 @@ router.post("/", createLead);
 router.get("/:id", getLead);
 router.put("/:id", updateLead);
 router.post("/:id/assign", assignLead);
+router.get("/:id/messages", getLeadMessages);
+router.post("/:id/messages", sendLeadMessage);
 router.post("/bulk-assign", bulkAssignLeads);
 router.post("/bulk-status", bulkStatusUpdate);
 router.delete("/:id", deleteLead);

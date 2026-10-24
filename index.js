@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import { createServer } from "node:http";
+import { Server } from "socket.io";
 import { env } from "./configs/env.js";
 import { connectPlatformDB, isDbConnected } from "./configs/db.js";
 import { cookieParser } from "./middlewares/cookieParser.js";
@@ -13,7 +15,10 @@ import teamRoutes from "./routes/teamRoutes.js";
 import aiConfigRoutes from "./routes/aiConfigRoutes.js";
 import followUpRoutes from "./routes/followUpRoutes.js";
 import organizationRoutes from "./routes/organizationRoutes.js";
+import whatsappRoutes from "./routes/whatsappRoutes.js";
 import { startFollowUpSchedulerWorker } from "./helpers/followUpEngine.js";
+import { restoreActiveConnections } from "./helpers/whatsappManager.js";
+import { attachWhatsAppSocketGateway } from "./helpers/whatsappSocketGateway.js";
 
 const app = express();
 
@@ -51,6 +56,7 @@ app.use("/api/team", teamRoutes);
 app.use("/api/ai", aiConfigRoutes);
 app.use("/api/follow-ups", followUpRoutes);
 app.use("/api/organization", organizationRoutes);
+app.use("/api/whatsapp", whatsappRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -69,15 +75,32 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server and connect to MongoDB platform db
+// Create HTTP server and bind Socket.IO gateway
 const PORT = env.PORT || 5000;
-app.listen(PORT, async () => {
+const httpServer = createServer(app);
+
+const io = new Server(httpServer, {
+  cors: {
+    origin: env.FRONTEND_URL,
+    credentials: true,
+    methods: ["GET", "POST"],
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
+
+attachWhatsAppSocketGateway(io);
+
+// Start server, connect DB, restore connections, and start follow-up worker
+httpServer.listen(PORT, async () => {
   console.log(`=======================================================`);
   console.log(`🚀 Conversly AI Backend running on port ${PORT}`);
   console.log(`📡 Frontend CORS allowed: ${env.FRONTEND_URL}`);
+  console.log(`⚡ Real-time Socket.IO Gateway: INITIALIZED`);
   console.log(`🔒 Single-login session enforcement: ACTIVE`);
   console.log(`=======================================================`);
   await connectPlatformDB();
+  await restoreActiveConnections();
   startFollowUpSchedulerWorker();
 });
 

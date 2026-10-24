@@ -3,6 +3,7 @@ import {
   tryConsumeDailyLeadQuota,
   rollbackDailyLeadQuota,
 } from "../helpers/entitlements.js";
+import { enqueueOutboundMessage } from "../helpers/outboundQueue.js";
 
 const ALLOWED_STATUSES = ["New", "Interested", "In-followup", "Converted", "Lost"];
 
@@ -792,5 +793,101 @@ export async function deleteLead(req, res) {
   } catch (err) {
     console.error("[Delete Lead Error]", err);
     return res.status(500).json({ success: false, message: "Failed to delete lead." });
+  }
+}
+
+/**
+ * GET /api/leads/:id/messages
+ * Retrieves WhatsApp chat history for a specific lead
+ */
+export async function getLeadMessages(req, res) {
+  try {
+    const { tenantModels } = req;
+    const { id } = req.params;
+
+    const lead = await tenantModels.Lead.findById(id);
+    if (!lead) {
+      return res.status(404).json({ success: false, message: "Lead not found." });
+    }
+
+    const messages = await tenantModels.WhatsAppMessage.find({ leadId: lead._id })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const serialized = messages.map((m) => ({
+      id: m._id.toString(),
+      leadId: m.leadId.toString(),
+      sender: m.direction === "inbound" ? "lead" : m.source === "ai" ? "ai" : "salesperson",
+      senderName:
+        m.direction === "inbound"
+          ? lead.name
+          : m.source === "ai"
+          ? "Conversly AI"
+          : "Sales Representative",
+      text: m.body,
+      timestamp: m.createdAt,
+      isDelivered: m.sendStatus === "sent",
+      isRead: true,
+      reactions: m.reactions || [],
+      isEphemeral: Boolean(m.isEphemeral),
+      sendStatus: m.sendStatus,
+    }));
+
+    return res.json({
+      success: true,
+      messages: serialized,
+    });
+  } catch (err) {
+    console.error("[Get Lead Messages Error]", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch messages." });
+  }
+}
+
+/**
+ * POST /api/leads/:id/messages
+ * Sends a manual outbound WhatsApp message from Shared Inbox to customer
+ */
+export async function sendLeadMessage(req, res) {
+  try {
+    const { tenantModels, organization } = req;
+    const { id } = req.params;
+    const { text } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ success: false, message: "Message text cannot be empty." });
+    }
+
+    const lead = await tenantModels.Lead.findById(id);
+    if (!lead) {
+      return res.status(404).json({ success: false, message: "Lead not found." });
+    }
+
+    const message = await enqueueOutboundMessage({
+      leadId: lead._id,
+      connectionId: lead.whatsappConnectionId,
+      body: text.trim(),
+      idempotencyKey: `manual:${lead._id}:${Date.now()}`,
+      source: "manual",
+      tenantModels,
+      orgId: organization?._id,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: {
+        id: message._id.toString(),
+        leadId: lead._id.toString(),
+        sender: "salesperson",
+        senderName: req.user?.name || "Sales Representative",
+        text: message.body,
+        timestamp: message.createdAt,
+        isDelivered: message.sendStatus === "sent",
+        isRead: true,
+        sendStatus: message.sendStatus,
+      },
+    });
+  } catch (err) {
+    console.error("[Send Lead Message Error]", err);
+    return res.status(500).json({ success: false, message: err.message || "Failed to send message." });
   }
 }
